@@ -1,0 +1,28 @@
+# Secrets
+.streamlit/secrets.toml
+.env
+credentials.json
+token.json
+
+# Cache and temp
+surge_cache.db
+surge_cache.db-wal
+surge_cache.db-shm
+.tmp/
+*.pyc
+__pycache__/
+
+# Data exports
+*.csv
+
+# Dead code (not used by the app)
+scrape_ria_contacts.py
+test_pdf_extract.py
+nul
+
+# IDE / OS / Local
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
