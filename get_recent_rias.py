@@ -40,16 +40,20 @@ def discover_sec_zip_url():
 
     for url, label in candidates:
         try:
-            # SEC blocks HEAD requests (403), so use GET with Range header
-            # to check existence without downloading the full file
+            # Use streaming GET to check existence without downloading the full file.
+            # SEC blocks HEAD and Range requests (403) from some IPs (e.g. cloud),
+            # so we start a real GET but close it immediately after reading the status.
             resp = requests.get(
                 url,
-                headers={**HEADERS, 'Range': 'bytes=0-0'},
+                headers=HEADERS,
                 timeout=15,
                 allow_redirects=True,
+                stream=True,
             )
-            if resp.status_code in (200, 206):
+            if resp.status_code == 200:
+                resp.close()
                 return url, label
+            resp.close()
         except requests.RequestException:
             continue
 
