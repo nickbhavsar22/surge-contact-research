@@ -359,7 +359,7 @@ if discover_btn:
 
     if result['error']:
         logger.error('Discovery failed: %s', result['error'])
-        st.error("Discovery failed. Please check your connection and try again.")
+        st.error(f"Discovery failed: {result['error']}")
     elif result['df'].empty:
         st.session_state.discovery_stats = {
             'snapshot_date': result['snapshot_date'] or 'N/A',
