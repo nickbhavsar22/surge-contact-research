@@ -65,8 +65,37 @@ EXCLUDED_EMAIL_PREFIXES = {
 TITLE_SEARCH_PATTERN = re.compile(
     r'(?:chief compliance officer|cco|principal|managing member|'
     r'managing partner|founder|co-founder|ceo|president|owner|'
-    r'chief executive|chief operating|partner|director|advisor|adviser)',
+    r'chief executive|chief operating|chief financial|partner|'
+    r'director|managing director|advisor|adviser)',
     re.IGNORECASE
+)
+
+# Pattern to match a standalone title line (line is mostly just a title)
+STANDALONE_TITLE_PATTERN = re.compile(
+    r'^\s*(?:(?:chief\s+)?(?:compliance\s+officer|executive\s+officer|'
+    r'operating\s+officer|financial\s+officer)|'
+    r'cco|ceo|coo|cfo|principal|managing\s+(?:member|partner|director)|'
+    r'founder(?:\s*[&+]\s*(?:managing\s+partner|ceo|president))?|'
+    r'co-founder|president|owner|partner|director|'
+    r'(?:senior\s+)?(?:advisor|adviser)|'
+    r'(?:head\s+of\s+\w+(?:\s+\w+)?)|'
+    r'(?:portfolio\s+manager))'
+    r'(?:\s*[&+,/]\s*(?:(?:chief\s+)?(?:compliance\s+officer|executive\s+officer|'
+    r'operating\s+officer|financial\s+officer)|'
+    r'cco|ceo|coo|cfo|principal|managing\s+(?:member|partner|director)|'
+    r'founder|president|owner|partner|director|'
+    r'head\s+of\s+\w+(?:\s+\w+)?|portfolio\s+manager))*'
+    r'\s*$',
+    re.IGNORECASE
+)
+
+# Pattern to extract a person name from the start of a bio paragraph
+# Matches: "Sam Caspersen has...", "Voltaire is the...", "Todd C. Schneider is..."
+BIO_NAME_PATTERN = re.compile(
+    r'^([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'
+    r'(?:\s+is\b|\s+has\b|\s+joined\b|\s+serves?\b|\s+leads?\b'
+    r'|\s+brings?\b|\s+founded\b|\s+manages?\b|\s+oversees?\b'
+    r'|,\s|\s+\(|\s+–\s|\s+—\s)'
 )
 
 NAME_PATTERN = re.compile(
@@ -90,6 +119,8 @@ FALSE_NAME_WORDS = {
     'PREMIER', 'PREMIUM', 'BASIC', 'STANDARD', 'ADVANCED', 'SELECT',
     'ABOUT', 'MORE', 'LEARN', 'VIEW', 'DETAILS', 'TERMS', 'PRIVACY',
     'POLICY', 'CONTACT', 'HELP', 'SUPPORT', 'HOME', 'BACK', 'NEXT',
+    'WHO', 'WE', 'ARE', 'OUR', 'YOUR', 'MEET', 'WORK', 'WITH',
+    'HOW', 'WHY', 'WHAT', 'GET', 'STARTED', 'READY', 'FIRM',
 }
 
 
@@ -185,7 +216,10 @@ def _extract_emails_from_soup(soup, domain):
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href']
         if href.lower().startswith('mailto:'):
-            email = href[7:].split('?')[0].strip().lower()
+            raw = href[7:].split('?')[0].strip()
+            # Strip URL encoding artifacts (%20, +, etc.)
+            raw = raw.replace('%20', '').replace('+', '').strip()
+            email = raw.lower()
             if EMAIL_PATTERN.fullmatch(email):
                 found.add(email)
 
@@ -212,92 +246,135 @@ def _extract_emails_from_soup(soup, domain):
     return filtered
 
 
+def _is_valid_person_name(name):
+    """Check if a string looks like a real person name (not a product/heading)."""
+    if not name or len(name) < 4 or len(name) > 50:
+        return False
+    name_words = name.upper().split()
+    if len(name_words) < 2:
+        return False
+    if any(w in name_words for w in CORP_WORDS):
+        return False
+    if any(w in FALSE_NAME_WORDS for w in name_words):
+        return False
+    return True
+
+
 def _extract_contacts_from_soup(soup, domain):
     """Extract structured contacts (name + title + email) from a page.
 
-    Uses two strategies:
-    A) Find title keywords in text, look for person names on adjacent lines
-    B) Find HTML elements with team/staff/bio CSS classes
+    Three strategies for how RIA websites typically display team info:
+    A) Title on standalone line, name starts the next paragraph
+       (most common pattern on small RIA sites)
+    B) "Name, Title" or "Name - Title" on the same line
+    C) Structured HTML team cards via CSS classes
     Then assigns emails to named contacts by matching name parts.
     """
     contacts = []
     emails = _extract_emails_from_soup(soup, domain)
     text_content = soup.get_text(separator='\n')
 
-    # Strategy A: Look for "Name, Title" or "Name - Title" patterns on same line
-    # This is conservative to avoid false positives from marketing text
-    name_title_patterns = [
-        # "John Smith, Chief Compliance Officer" or "John Smith | CEO"
-        re.compile(
-            r'\b([A-Z][a-z]+\s+(?:[A-Z]\.?\s+)?[A-Z][a-z]+)\s*[,|–—\-]\s*'
-            r'((?:Chief\s+)?(?:Compliance\s+Officer|CCO|Principal|Managing\s+(?:Member|Partner|Director)'
-            r'|Founder|Co-Founder|CEO|President|Owner|COO|CFO|Partner|Director'
-            r'|Chief\s+Executive|Chief\s+Operating|Chief\s+Financial|Advisor|Adviser))',
-            re.IGNORECASE
-        ),
-        # "Chief Compliance Officer: John Smith" or "CCO - John Smith"
-        re.compile(
-            r'(?:(?:Chief\s+)?(?:Compliance\s+Officer|CCO|Principal|Managing\s+(?:Member|Partner|Director)'
-            r'|Founder|Co-Founder|CEO|President|Owner|COO|CFO|Partner|Director'
-            r'|Chief\s+Executive|Chief\s+Operating|Chief\s+Financial|Advisor|Adviser))'
-            r'\s*[:\-–—|]\s*([A-Z][a-z]+\s+(?:[A-Z]\.?\s+)?[A-Z][a-z]+)',
-            re.IGNORECASE
-        ),
-    ]
-
     lines = text_content.split('\n')
-    for line in lines:
-        for pat_idx, pattern in enumerate(name_title_patterns):
-            match = pattern.search(line)
-            if not match:
-                continue
-            if pat_idx == 0:
-                name, title_found = match.group(1).strip(), match.group(2).strip()
-            else:
-                name, title_found = match.group(1).strip(), ''
-                # Extract title from the match for pattern 2
-                title_m = TITLE_SEARCH_PATTERN.search(line)
-                title_found = title_m.group().strip() if title_m else ''
+    # Clean up: strip whitespace from all lines for consistent matching
+    stripped = [line.strip() for line in lines]
 
-            name_words = name.upper().split()
-            if any(w in name_words for w in CORP_WORDS):
-                continue
-            if any(w in FALSE_NAME_WORDS for w in name_words):
-                continue
-            if len(name) < 4 or len(name) > 40:
-                continue
+    # Strategy A: Title on standalone line → name starts next non-empty line
+    # Pattern seen on real RIA sites:
+    #   "Founder & Managing Partner"    ← standalone title line
+    #   ""                              ← blank
+    #   "Sam Caspersen has fifteen..."  ← name starts the bio
+    for i, line in enumerate(stripped):
+        if not line:
+            continue
+        # Check if this line is a standalone title (short line, mostly title text)
+        if len(line) > 80:
+            continue
+        if not STANDALONE_TITLE_PATTERN.match(line):
+            continue
 
-            contacts.append({
-                'name': name,
-                'email': '',
-                'title': title_found.title() if title_found else '',
-                'source': 'website',
-            })
-            break
+        title_found = line.strip()
 
-    # Strategy B: Structured team cards via CSS classes
+        # Look forward for name in the next non-empty line(s)
+        # Use a wide window (10 lines) because extracted text often has many blanks
+        for j in range(i + 1, min(i + 10, len(stripped))):
+            next_line = stripped[j]
+            if not next_line:
+                continue
+            # Try to extract a person name starting the bio paragraph
+            bio_match = BIO_NAME_PATTERN.match(next_line)
+            if bio_match:
+                name = bio_match.group(1).strip()
+                if _is_valid_person_name(name):
+                    contacts.append({
+                        'name': name,
+                        'email': '',
+                        'title': title_found.title(),
+                        'source': 'website',
+                    })
+            break  # Only check the first non-empty line after title
+
+    # Strategy B: "Name, Title" or "Name - Title" on the same line
+    same_line_pattern = re.compile(
+        r'\b([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+)\s*[,|–—\-]\s*'
+        r'((?:Chief\s+)?(?:Compliance\s+Officer|CCO|Principal|Managing\s+(?:Member|Partner|Director)'
+        r'|Founder|Co-Founder|CEO|President|Owner|COO|CFO|Partner|Director'
+        r'|Chief\s+Executive|Chief\s+Operating|Chief\s+Financial|Advisor|Adviser))',
+        re.IGNORECASE
+    )
+    for line in stripped:
+        match = same_line_pattern.search(line)
+        if match:
+            name = match.group(1).strip()
+            title_found = match.group(2).strip()
+            if _is_valid_person_name(name):
+                contacts.append({
+                    'name': name,
+                    'email': '',
+                    'title': title_found.title(),
+                    'source': 'website',
+                })
+
+    # Strategy C: Structured team cards via CSS classes
     for selector in ['[class*="team"]', '[class*="staff"]', '[class*="bio"]',
-                     '[class*="member"]', '[class*="advisor"]']:
+                     '[class*="member"]', '[class*="advisor"]',
+                     '[class*="person"]', '[class*="profile"]']:
         cards = soup.select(selector)
         for card in cards[:10]:
             card_text = card.get_text(separator='\n')
+            card_lines = [cl.strip() for cl in card_text.split('\n') if cl.strip()]
+            # Look for title line + name in card
+            for ci, cline in enumerate(card_lines):
+                if len(cline) > 80:
+                    continue
+                if STANDALONE_TITLE_PATTERN.match(cline):
+                    # Check surrounding lines for a name
+                    for offset in [-1, 1, -2, 2]:
+                        ni = ci + offset
+                        if 0 <= ni < len(card_lines):
+                            name_match = NAME_PATTERN.match(card_lines[ni])
+                            if name_match and _is_valid_person_name(name_match.group(1)):
+                                contacts.append({
+                                    'name': name_match.group(1).strip(),
+                                    'email': '',
+                                    'title': cline.title(),
+                                    'source': 'website',
+                                })
+                                break
+                    break
+            # Also try: NAME_PATTERN + TITLE in card without standalone title line
             names_in_card = NAME_PATTERN.findall(card_text)
             titles_in_card = TITLE_SEARCH_PATTERN.findall(card_text)
             if names_in_card and titles_in_card:
                 name = names_in_card[0].strip()
-                if len(name) < 4 or len(name) > 40:
-                    continue
-                name_words = name.upper().split()
-                if any(w in name_words for w in CORP_WORDS):
-                    continue
-                if any(w in FALSE_NAME_WORDS for w in name_words):
-                    continue
-                contacts.append({
-                    'name': name,
-                    'email': '',
-                    'title': titles_in_card[0].strip().title(),
-                    'source': 'website',
-                })
+                if _is_valid_person_name(name):
+                    # Avoid duplicating contacts already found
+                    if not any(c['name'] == name for c in contacts):
+                        contacts.append({
+                            'name': name,
+                            'email': '',
+                            'title': titles_in_card[0].strip().title(),
+                            'source': 'website',
+                        })
 
     # Assign emails to contacts by matching name parts to email local part
     for contact in contacts:
@@ -388,9 +465,15 @@ def _scrape_website_contacts(website_url):
 
 
 def _select_best_contact(candidates):
-    """Select the single best contact from all discovered candidates.
+    """Select the best contact by merging the best name+title with the best email.
 
-    Priority: (1) has both name+email, (2) higher title rank, (3) Hunter.io source.
+    On small RIA sites, the founder's name/title and a contact email often appear
+    as separate entries (e.g., "Sam Caspersen, CEO" on the about page and
+    "marc@firm.com" in the footer). This function merges them:
+    1. Find the best *named* contact (by title priority)
+    2. Find the best *email* (prefer domain-matching, non-generic)
+    3. If the named contact has no email, attach the best available email
+
     Returns dict with keys: name, email, title (any may be empty string).
     """
     empty = {'name': '', 'email': '', 'title': ''}
@@ -404,21 +487,39 @@ def _select_best_contact(candidates):
                 return i
         return 999
 
-    def _sort_key(contact):
-        has_both = bool(contact.get('name')) and bool(contact.get('email'))
-        has_email = bool(contact.get('email'))
-        title_rank = _title_rank(contact.get('title', ''))
-        source_rank = 0 if contact.get('source') == 'hunter.io' else 1
-        return (not has_both, not has_email, title_rank, source_rank)
+    # Find the best named contact (must have a name)
+    named = [c for c in candidates if c.get('name')]
+    best_named = None
+    if named:
+        named.sort(key=lambda c: (
+            _title_rank(c.get('title', '')),
+            0 if c.get('source') == 'hunter.io' else 1,
+        ))
+        best_named = named[0]
 
-    candidates_sorted = sorted(candidates, key=_sort_key)
-    best = candidates_sorted[0]
+    # Find the best email across all candidates
+    best_email = ''
+    for c in candidates:
+        email = c.get('email', '').strip()
+        if email:
+            # If the named contact already has an email matched to them, use it
+            if best_named and c.get('name') == best_named.get('name') and email:
+                best_email = email
+                break
+            if not best_email:
+                best_email = email
 
-    return {
-        'name': best.get('name', '').strip(),
-        'email': best.get('email', '').strip(),
-        'title': best.get('title', '').strip(),
-    }
+    if best_named:
+        return {
+            'name': best_named.get('name', '').strip(),
+            'email': best_named.get('email', '').strip() or best_email,
+            'title': best_named.get('title', '').strip(),
+        }
+    elif best_email:
+        # No named contact found, return best email
+        return {'name': '', 'email': best_email, 'title': ''}
+    else:
+        return empty
 
 
 def enrich_contact(website_url, hunter_api_key=None):
