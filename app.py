@@ -10,12 +10,14 @@ import hashlib
 import logging
 import base64
 import time
+import os
 from pathlib import Path
 from datetime import date, timedelta
 
 from get_recent_rias import get_recent_rias
 from score_fit import calculate_fit_score
-from cache_db import lookup_scores, save_scores
+from cache_db import lookup_scores, save_scores, lookup_enrichments, save_enrichments
+from tools.enrich_contacts import enrich_contact
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +191,16 @@ def _check_password():
 if not _check_password():
     st.stop()
 
+
+def _get_hunter_api_key():
+    """Get Hunter.io API key from Streamlit secrets or environment.
+    Returns None if not configured (enrichment still works via scraping only).
+    """
+    key = st.secrets.get("hunter_api_key", "")
+    if key:
+        return key
+    return os.environ.get("HUNTER_API_KEY", "") or None
+
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
@@ -309,6 +321,12 @@ def _build_col_config(df):
         config['Employees'] = st.column_config.NumberColumn('Employees', format='%d')
     if 'Clients' in df.columns:
         config['Clients'] = st.column_config.NumberColumn('Clients', format='%d')
+    if 'Contact_Name' in df.columns:
+        config['Contact_Name'] = st.column_config.TextColumn('Contact')
+    if 'Contact_Email' in df.columns:
+        config['Contact_Email'] = st.column_config.TextColumn('Email')
+    if 'Contact_Title' in df.columns:
+        config['Contact_Title'] = st.column_config.TextColumn('Title')
     return config
 
 
@@ -382,14 +400,19 @@ if discover_btn:
         if 'AUM' in df.columns:
             df['AUM_Display'] = df['AUM'].apply(_format_aum)
 
-        # -- Phase 2: Check cache for existing scores --
+        # -- Phase 2: Check cache for existing scores and contacts --
         crd_list = [_safe_crd(c) for c in df['CRD']]
         valid_crds = [c for c in crd_list if c is not None]
         cached_scores = lookup_scores(valid_crds)
+        cached_enrichments = lookup_enrichments(valid_crds)
+        hunter_key = _get_hunter_api_key()
 
         # Initialize columns
         df['Fit_Score'] = '...'
         df['Fit_Reasons'] = ''
+        df['Contact_Name'] = ''
+        df['Contact_Email'] = ''
+        df['Contact_Title'] = ''
 
         # Populate from cache
         cached_count = 0
@@ -402,6 +425,11 @@ if discover_btn:
                 cached_count += 1
             else:
                 new_indices.append(idx)
+            # Populate cached contacts regardless of score cache status
+            if crd and crd in cached_enrichments:
+                df.at[idx, 'Contact_Name'] = cached_enrichments[crd].get('contact_name', '')
+                df.at[idx, 'Contact_Email'] = cached_enrichments[crd].get('contact_email', '')
+                df.at[idx, 'Contact_Title'] = cached_enrichments[crd].get('contact_title', '')
 
         new_count = len(new_indices)
         st.success(
@@ -425,12 +453,14 @@ if discover_btn:
             scored_count = 0
             na_count = 0
             new_score_records = []
+            new_enrich_records = []
 
             for i, idx in enumerate(new_indices):
                 position = i + 1
                 row = df.loc[idx]
                 company = str(row.get('Company', 'Unknown'))[:40]
                 crd = _safe_crd(row['CRD'])
+                website = str(row.get('Website', ''))
 
                 progress_bar.progress(position / new_count)
                 progress_text.markdown(
@@ -447,15 +477,38 @@ if discover_btn:
                 else:
                     scored_count += 1
 
-                # Queue for cache save
+                # Queue score for cache save
                 if crd:
                     new_score_records.append({
                         'crd': crd,
                         'company': str(row.get('Company', '')),
-                        'website': str(row.get('Website', '')),
+                        'website': website,
                         'fit_score': str(score_result['Fit_Score']),
                         'fit_reasons': score_result['Fit_Reasons'],
                     })
+
+                # Enrich contact (skip if already cached)
+                has_website = website and website.lower() not in ('nan', '', 'none')
+                already_enriched = crd and crd in cached_enrichments
+                if has_website and not already_enriched:
+                    progress_text.markdown(
+                        f'<p class="progress-text">[{position}/{new_count}] Enriching: {company}</p>',
+                        unsafe_allow_html=True,
+                    )
+                    contact = enrich_contact(website, hunter_api_key=hunter_key)
+                    df.at[idx, 'Contact_Name'] = contact['contact_name']
+                    df.at[idx, 'Contact_Email'] = contact['contact_email']
+                    df.at[idx, 'Contact_Title'] = contact['contact_title']
+
+                    if crd:
+                        new_enrich_records.append({
+                            'crd': crd,
+                            'contact_name': contact['contact_name'],
+                            'contact_email': contact['contact_email'],
+                            'contact_title': contact['contact_title'],
+                        })
+                elif not has_website:
+                    time.sleep(0.5)
 
                 # Refresh table every 5 rows or on last row
                 if position % 5 == 0 or position == new_count:
@@ -466,17 +519,13 @@ if discover_btn:
                         column_config=_build_col_config(df),
                     )
 
-                # Rate limit website fetches
-                website = str(row.get('Website', ''))
-                if website and website.lower() not in ('nan', '', 'none'):
-                    time.sleep(0.5)
-
             progress_bar.empty()
             progress_text.empty()
             table_placeholder.empty()
 
-            # Persist new scores to cache
+            # Persist new scores and enrichments to cache
             save_scores(new_score_records)
+            save_enrichments(new_enrich_records)
         else:
             scored_count = 0
             na_count = 0
