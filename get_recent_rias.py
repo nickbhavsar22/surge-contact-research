@@ -4,6 +4,7 @@ import io
 import logging
 import pandas as pd
 from datetime import datetime, timedelta, date
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -13,14 +14,12 @@ HEADERS = {
 
 SEC_BASE_URL = 'https://www.sec.gov/files/investment/data/information-about-registered-investment-advisers-exempt-reporting-advisers/'
 
+# Pre-downloaded CSV (committed by GitHub Actions nightly)
+_PRELOADED_CSV = Path(__file__).resolve().parent / 'data' / 'sec_advisers.csv'
+
 
 def _build_candidate_urls():
-    """Build candidate SEC FOIA ZIP URLs for recent months.
-
-    The SEC publishes monthly snapshots with filenames like ia010226.zip (MMDDYY).
-    Returns candidate (url, date_label) tuples for the 1st and 2nd of each month
-    going back 4 months.
-    """
+    """Build candidate SEC FOIA ZIP URLs for recent months."""
     today = date.today()
     candidates = []
     for months_back in range(0, 4):
@@ -37,12 +36,7 @@ def _build_candidate_urls():
 
 
 def _download_sec_zip(candidates, headers, timeout=300, log=None):
-    """Try each candidate URL with a full download. Return (response, url, label) or None.
-
-    Skips the separate URL discovery step because SEC blocks lightweight
-    probe requests (HEAD, Range, even streaming GET) from cloud server IPs.
-    Wrong URLs return 404 quickly; the correct one downloads the full ZIP.
-    """
+    """Try each candidate URL with a full download. Return (response, url, label) or None."""
     for url, label in candidates:
         try:
             if log:
@@ -50,10 +44,24 @@ def _download_sec_zip(candidates, headers, timeout=300, log=None):
             resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
             if resp.status_code == 200:
                 return resp, url, label
-            # 404 = wrong date, try next; 403 = blocked, try next
         except requests.RequestException:
             continue
     return None
+
+
+def _load_predownloaded_csv(log=None):
+    """Load pre-downloaded SEC data CSV (committed by GitHub Actions).
+
+    Returns DataFrame or None if the file doesn't exist.
+    """
+    if not _PRELOADED_CSV.exists():
+        return None
+    if log:
+        log('Loading pre-downloaded SEC database...')
+    df = pd.read_csv(_PRELOADED_CSV, low_memory=False)
+    if log:
+        log(f'Loaded {len(df):,} records from pre-downloaded data')
+    return df
 
 
 def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=False, progress_callback=None):
@@ -81,25 +89,29 @@ def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=Fal
         else:
             print(msg)
 
-    # Download SEC database — tries candidate URLs directly (no separate discovery
-    # step, because SEC blocks probe requests from cloud IPs).
-    log('Downloading SEC Investment Adviser database...')
-    candidates = _build_candidate_urls()
-    download = _download_sec_zip(candidates, HEADERS, timeout=300, log=log)
+    # Try pre-downloaded CSV first (committed by GitHub Actions nightly).
+    # Falls back to live SEC download if the file doesn't exist (e.g. local dev).
+    zip_url = None
+    df = _load_predownloaded_csv(log=log)
 
-    if download is None:
-        error_msg = 'Could not download SEC database. All candidate URLs failed (SEC may be blocking this server).'
-        log(f'ERROR: {error_msg}')
-        return {'df': pd.DataFrame(), 'total_records': 0, 'snapshot_date': None, 'zip_url': None, 'error': error_msg}
+    if df is None:
+        # Fallback: download directly from SEC (works locally, blocked on some cloud hosts)
+        log('No pre-downloaded data found. Downloading from SEC...')
+        candidates = _build_candidate_urls()
+        download = _download_sec_zip(candidates, HEADERS, timeout=300, log=log)
 
-    resp, zip_url, url_label = download
-    log(f'Downloaded SEC database: {url_label}')
+        if download is None:
+            error_msg = 'Could not load SEC data. Pre-downloaded file missing and live download failed.'
+            log(f'ERROR: {error_msg}')
+            return {'df': pd.DataFrame(), 'total_records': 0, 'snapshot_date': None, 'zip_url': None, 'error': error_msg}
 
-    # Extract CSV from ZIP
-    log('Extracting and parsing data...')
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-        with z.open(z.namelist()[0]) as f:
-            df = pd.read_csv(f, encoding='latin-1', low_memory=False)
+        resp, zip_url, url_label = download
+        log(f'Downloaded SEC database: {url_label}')
+
+        log('Extracting and parsing data...')
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            with z.open(z.namelist()[0]) as f:
+                df = pd.read_csv(f, encoding='latin-1', low_memory=False)
 
     # Convert dates
     df['Status_Date'] = pd.to_datetime(df['SEC Status Effective Date'], errors='coerce')

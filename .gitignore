@@ -12,8 +12,9 @@ surge_cache.db-shm
 *.pyc
 __pycache__/
 
-# Data exports
+# Data exports (but keep pre-downloaded SEC data)
 *.csv
+!data/sec_advisers.csv
 
 # Dead code (not used by the app)
 scrape_ria_contacts.py
