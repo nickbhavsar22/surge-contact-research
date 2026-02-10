@@ -14,50 +14,46 @@ HEADERS = {
 SEC_BASE_URL = 'https://www.sec.gov/files/investment/data/information-about-registered-investment-advisers-exempt-reporting-advisers/'
 
 
-def discover_sec_zip_url():
-    """Try recent MMDDYY date patterns to find the current SEC FOIA ZIP.
+def _build_candidate_urls():
+    """Build candidate SEC FOIA ZIP URLs for recent months.
 
     The SEC publishes monthly snapshots with filenames like ia010226.zip (MMDDYY).
-    Tries the 1st of each month going back 4 months.
-
-    Returns:
-        tuple: (url, date_label) or (None, None) if not found
+    Returns candidate (url, date_label) tuples for the 1st and 2nd of each month
+    going back 4 months.
     """
     today = date.today()
     candidates = []
     for months_back in range(0, 4):
-        # Walk back by month
         year = today.year
         month = today.month - months_back
         while month <= 0:
             month += 12
             year -= 1
-        # Try the 1st and 2nd of the month
         for day in [1, 2]:
             d = date(year, month, day)
             stamp = d.strftime('%m%d%y')
             candidates.append((f'{SEC_BASE_URL}ia{stamp}.zip', d.strftime('%Y-%m-%d')))
+    return candidates
 
+
+def _download_sec_zip(candidates, headers, timeout=300, log=None):
+    """Try each candidate URL with a full download. Return (response, url, label) or None.
+
+    Skips the separate URL discovery step because SEC blocks lightweight
+    probe requests (HEAD, Range, even streaming GET) from cloud server IPs.
+    Wrong URLs return 404 quickly; the correct one downloads the full ZIP.
+    """
     for url, label in candidates:
         try:
-            # Use streaming GET to check existence without downloading the full file.
-            # SEC blocks HEAD and Range requests (403) from some IPs (e.g. cloud),
-            # so we start a real GET but close it immediately after reading the status.
-            resp = requests.get(
-                url,
-                headers=HEADERS,
-                timeout=15,
-                allow_redirects=True,
-                stream=True,
-            )
+            if log:
+                log(f'Trying SEC database: {label}...')
+            resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
             if resp.status_code == 200:
-                resp.close()
-                return url, label
-            resp.close()
+                return resp, url, label
+            # 404 = wrong date, try next; 403 = blocked, try next
         except requests.RequestException:
             continue
-
-    return None, None
+    return None
 
 
 def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=False, progress_callback=None):
@@ -85,27 +81,19 @@ def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=Fal
         else:
             print(msg)
 
-    # Auto-discover the SEC ZIP URL
-    log('Discovering latest SEC database URL...')
-    zip_url, url_label = discover_sec_zip_url()
+    # Download SEC database — tries candidate URLs directly (no separate discovery
+    # step, because SEC blocks probe requests from cloud IPs).
+    log('Downloading SEC Investment Adviser database...')
+    candidates = _build_candidate_urls()
+    download = _download_sec_zip(candidates, HEADERS, timeout=300, log=log)
 
-    if not zip_url:
-        error_msg = 'Could not find a valid SEC FOIA ZIP file. The URL pattern may have changed.'
+    if download is None:
+        error_msg = 'Could not download SEC database. All candidate URLs failed (SEC may be blocking this server).'
         log(f'ERROR: {error_msg}')
         return {'df': pd.DataFrame(), 'total_records': 0, 'snapshot_date': None, 'zip_url': None, 'error': error_msg}
 
-    log(f'Found SEC database: {url_label}')
-
-    # Download data
-    log('Downloading SEC Investment Adviser database...')
-    try:
-        resp = requests.get(zip_url, headers=HEADERS, timeout=300)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        logger.error('SEC database download failed: %s', e)
-        error_msg = 'Error downloading SEC database. Please try again later.'
-        log(error_msg)
-        return {'df': pd.DataFrame(), 'total_records': 0, 'snapshot_date': None, 'zip_url': zip_url, 'error': error_msg}
+    resp, zip_url, url_label = download
+    log(f'Downloaded SEC database: {url_label}')
 
     # Extract CSV from ZIP
     log('Extracting and parsing data...')
