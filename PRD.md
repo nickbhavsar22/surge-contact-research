@@ -2,7 +2,7 @@
 
 ## Overview
 
-Surge Contact Research is a two-stage data pipeline that identifies newly registered Investment Advisers (RIAs) from the SEC's public FOIA database and enriches those records with contact information by parsing Form ADV PDF filings. The output is a sales-ready CSV of recently registered financial advisory firms with key contact details.
+Surge Contact Research is a three-stage data pipeline that identifies newly registered Investment Advisers (RIAs) from the SEC's public FOIA database, scores them against SurgeONE.ai's ideal customer profile, and enriches records with contact information via website scraping and Hunter.io. The output is a filterable Streamlit dashboard with CSV export of sales-ready leads.
 
 ## Business Objective
 
@@ -13,7 +13,8 @@ Generate high-quality leads for financial services outreach by targeting firms i
 | Source | URL Pattern | Format | Update Frequency |
 |--------|------------|--------|-----------------|
 | SEC FOIA Investment Adviser Database | `sec.gov/files/investment/data/.../ia*.zip` | ZIP → CSV | Monthly |
-| Form ADV PDF Filings | `reports.adviserinfo.sec.gov/reports/ADV/{CRD}/PDF/{CRD}.pdf` | PDF | Per-filing |
+| RIA Firm Websites | Scraped from Website Address in SEC data | HTML | Live |
+| Hunter.io Domain Search API | `api.hunter.io/v2/domain-search` | JSON | Live (50/month free tier) |
 
 ## Pipeline Stages
 
@@ -32,27 +33,32 @@ Generate high-quality leads for financial services outreach by targeting firms i
 **Input:** SEC FOIA ZIP file (remote)
 **Output:** `new_rias_YYYYMMDD.csv`
 
-### Stage 2: Enrichment (`scrape_ria_contacts.py`)
+### Stage 2: Fit Scoring (`score_fit.py`)
 
-**Purpose:** Enrich each RIA record with contact name, email, and title by parsing their Form ADV PDF.
+**Purpose:** Score each RIA against SurgeONE.ai's ideal customer profile using data signals and website content analysis.
+
+**Scoring Rubric (normalized to 0-100):**
+- **Data score (max 50 pts):** website presence (8), phone (3), name keywords indicating advisory focus (6+4), top financial state (4), employees (up to 10), AUM (up to 10), clients (up to 5)
+- **Website score (max 70 pts):** site reachable (5), compliance keywords (14), advisory services (12), cybersecurity (11), team section (10), client/AUM info (10), technology (8)
+
+Firms with insufficient data (data score <= 3 and no website) are marked "N/A".
+
+### Stage 3: Contact Enrichment (`tools/enrich_contacts.py`)
+
+**Purpose:** Enrich each RIA record with contact name, email, and title by scraping their website and querying Hunter.io.
 
 **Process:**
-1. Load the Stage 1 CSV output
-2. For each firm (by CRD number), download the Form ADV PDF from SEC
-3. Extract text from the first 15 pages using `pdfplumber`
-4. Apply regex patterns to extract:
-   - **Principal/Owner name** — from the "your last, first, and middle names" section
-   - **Chief Compliance Officer** — from section J of the filing (takes priority over principal)
-   - **Email addresses** — first valid non-SEC/FINRA email found
-5. Filter out corporate entities (LLC, INC, LTD, etc.) from name fields
-6. Save enriched CSV with `Contact_Name`, `Contact_Email`, `Contact_Title` columns
+1. Query Hunter.io Domain Search API for employee emails (if API key configured)
+2. Scrape firm homepage + common subpages (/contact, /about, /team, /leadership, /advisors, /bio)
+3. Extract contacts using three strategies:
+   - **Strategy A:** Standalone title line followed by name in bio paragraph
+   - **Strategy B:** Name and title on same line (e.g., "Sam Caspersen, CEO")
+   - **Strategy C:** Structured HTML team cards (CSS class matching)
+4. Select best contact by title priority (CCO > Principal > Managing Member > VP > etc.)
+5. Match contact names to extracted emails by comparing name parts to email local part
+6. Filter out corporate entities, generic emails (info@, support@), and government domains
 
-**Input:** `new_rias_contacts_30days.csv`
-**Output:** `new_rias_contacts_with_names.csv`
-
-### Stage 3 (Prototype): PDF Extraction Testing (`test_pdf_extract.py`)
-
-**Purpose:** Standalone test script used during development to validate regex extraction logic against known CRD numbers.
+**Title Priority:** Chief Compliance Officer, CCO, Principal, Managing Member, Managing Director, Managing Partner, CEO, President, Founder, Owner, Partner, Director, VP
 
 ## Data Schema
 
@@ -70,44 +76,53 @@ Generate high-quality leads for financial services outreach by targeting firms i
 | `Website` | Website Address | Firm website |
 | `Legal_Name` | Legal Name | Legal entity name |
 
-### Stage 2 Enrichment Fields
+### Fit Scoring Fields
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `Fit_Score` | `score_fit.py` | 0-100 normalized score (or "N/A" for insufficient data) |
+| `Fit_Reasons` | `score_fit.py` | Semicolon-delimited breakdown of scoring factors |
+
+### Contact Enrichment Fields
 
 | Field | Extraction Method | Description |
 |-------|------------------|-------------|
-| `Contact_Name` | Regex on Form ADV text | Principal owner or CCO name |
-| `Contact_Email` | Regex email pattern | First valid business email found |
-| `Contact_Title` | Derived from extraction source | "Principal/Owner" or "Chief Compliance Officer" |
+| `Contact_Name` | Website scraping + Hunter.io | Best-matched person name by title priority |
+| `Contact_Email` | Hunter.io API + email regex | Business email matched to contact name |
+| `Contact_Title` | Title pattern matching | Role title (e.g., "Chief Compliance Officer", "Principal") |
 
 ## Technical Dependencies
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `requests` | * | HTTP client for SEC downloads |
-| `pdfplumber` | * | PDF text extraction from Form ADV filings |
-| `pandas` | * | Data manipulation and CSV I/O |
+| `streamlit` | 1.54.0 | Web UI framework |
+| `requests` | 2.32.5 | HTTP client for SEC downloads and website scraping |
+| `pandas` | 2.3.3 | Data manipulation and CSV I/O |
+| `beautifulsoup4` | 4.13.4 | HTML parsing for contact extraction |
 | `zipfile` | stdlib | Extract SEC FOIA ZIP archives |
 
 ## Rate Limiting & Compliance
 
-- **Rate limit:** 1-second delay between PDF requests (`time.sleep(1)`)
-- **User-Agent:** Standard browser UA string to comply with SEC access policies
-- **Timeout:** 45s per PDF request, 120s for ZIP download
-- **Page limit:** Only first 15 pages of each PDF are processed (performance optimization)
-- **Data source:** All data is from publicly available SEC FOIA datasets and public Form ADV filings
+- **SEC download:** 300s timeout, candidate URL fallback (tries multiple monthly snapshots)
+- **Website scraping:** 0.3s delay between subpage fetches, 15s timeout per request
+- **Contact enrichment:** 0.5s delay between firms during batch enrichment
+- **Hunter.io:** Free tier limited to 50 domain searches/month; 429 errors caught and logged
+- **User-Agent:** Standard browser UA string to comply with website access policies
+- **Data source:** All data is from publicly available SEC FOIA datasets and public RIA firm websites
 
 ## Known Limitations
 
-1. **Regex-based extraction:** Contact name and title extraction relies on regex patterns matching specific Form ADV formatting. PDFs with non-standard layouts may not yield results.
-2. **Monthly data lag:** The SEC FOIA database is updated monthly, so the "last 30 days" filter is relative to the snapshot date, not real-time.
-3. **Hardcoded ZIP URL:** The SEC FOIA ZIP URL in `get_recent_rias.py` includes a date-stamped filename (`ia010226.zip`) that must be updated manually when new snapshots are released.
-4. **Single email capture:** Only the first valid non-government email is captured per firm; additional contacts are discarded.
-5. **No deduplication:** Running the pipeline multiple times may produce overlapping records if the SEC data overlaps between snapshots.
-6. **No persistent storage:** Results are CSV-only with no database backend for historical tracking.
+1. **Website-dependent enrichment:** Contact extraction relies on scraping firm websites. Sites with non-standard layouts, JavaScript-rendered content, or no team/contact pages may not yield results.
+2. **Monthly data lag:** The SEC FOIA database is updated monthly, so the date filter is relative to the snapshot date, not real-time.
+3. **Hunter.io quota:** Free tier allows 50 domain searches/month. Beyond that, enrichment falls back to website scraping only.
+4. **Single contact per firm:** Only the highest-priority contact is returned per firm; additional contacts are discarded.
+5. **Ephemeral cache:** SQLite cache on Streamlit Cloud resets on reboot/redeploy. Scores and enrichments are recomputed as needed (fast enough for the dataset size).
+6. **SEC CCO data unavailable:** Item 1.J (Chief Compliance Officer) is deliberately excluded from the public FOIA CSV, and Form ADV PDFs render as flat images without extractable text for filled-in values.
 
 ## Future Enhancements (Suggested)
 
-- Automate ZIP URL discovery by scraping the SEC FOIA index page
 - Add LinkedIn profile matching for enriched contacts
-- Store results in a database for deduplication and historical tracking
+- Persistent database backend for deduplication and historical tracking
 - Add configurable output formats (JSON, Excel)
 - Integrate with CRM via API for direct lead import
+- Async website fetching for faster batch enrichment

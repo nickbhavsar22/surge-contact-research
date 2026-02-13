@@ -3,6 +3,8 @@ Surge Contact Research — Streamlit UI
 Discover newly registered RIAs, score them against SurgeONE.ai's ICP.
 """
 
+__version__ = "1.0.0"
+
 import streamlit as st
 import pandas as pd
 import html
@@ -285,6 +287,10 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
+    # Version footer
+    st.markdown('---')
+    st.caption(f'v{__version__}')
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -361,6 +367,10 @@ def _safe_crd(val):
 # ---------------------------------------------------------------------------
 
 if discover_btn:
+    # Warn if previous results will be replaced
+    if st.session_state.scored_df is not None and not st.session_state.scored_df.empty:
+        st.warning('Previous results will be replaced. Use the Download CSV button above to save them first.')
+
     # -- Phase 1: Download & filter SEC database --
     status_container = st.empty()
     messages = []
@@ -496,7 +506,7 @@ if discover_btn:
                         unsafe_allow_html=True,
                     )
                     contact = enrich_contact(website, hunter_api_key=hunter_key)
-                    df.at[idx, 'Contact_Name'] = contact['contact_name']
+                    df.at[idx, 'Contact_Name'] = contact['contact_name'] or 'No contact found'
                     df.at[idx, 'Contact_Email'] = contact['contact_email']
                     df.at[idx, 'Contact_Title'] = contact['contact_title']
 
@@ -508,6 +518,7 @@ if discover_btn:
                             'contact_title': contact['contact_title'],
                         })
                 elif not has_website:
+                    df.at[idx, 'Contact_Name'] = 'No website'
                     time.sleep(0.5)
 
                 # Refresh table every 5 rows or on last row
