@@ -3,7 +3,7 @@ Surge Contact Research — Streamlit UI
 Discover newly registered RIAs, score them against SurgeONE.ai's ICP.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import streamlit as st
 import pandas as pd
