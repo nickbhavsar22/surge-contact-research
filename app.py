@@ -3,7 +3,7 @@ Surge Contact Research — Streamlit UI
 Discover newly registered RIAs, score them against SurgeONE.ai's ICP.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.5"
 
 import streamlit as st
 import pandas as pd
@@ -16,10 +16,10 @@ import os
 from pathlib import Path
 from datetime import date, timedelta
 
-from get_recent_rias import get_recent_rias
+from get_recent_rias import get_recent_rias, get_era_pipeline
 from score_fit import calculate_fit_score
 from cache_db import lookup_scores, save_scores, lookup_enrichments, save_enrichments
-from tools.enrich_contacts import enrich_contact
+from tools.enrich_contacts import enrich_contact, get_hunter_account_info
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,12 @@ _logo_dark_b64 = base64.b64encode(_logo_dark_path.read_bytes()).decode() if _log
 def _cached_get_recent_rias(start_date, end_date):
     """Cache SEC ZIP download for 1 hour to avoid repeated 100MB+ downloads."""
     return get_recent_rias(start_date=start_date, end_date=end_date)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_get_era_pipeline(aum_min, aum_max):
+    """Cache ERA pipeline data for 1 hour."""
+    return get_era_pipeline(aum_min=aum_min, aum_max=aum_max)
 
 # ---------------------------------------------------------------------------
 # Page config & branding
@@ -215,6 +221,10 @@ if 'discovery_stats' not in st.session_state:
     st.session_state.discovery_stats = None
 if 'scoring_stats' not in st.session_state:
     st.session_state.scoring_stats = None
+if 'pipeline_df' not in st.session_state:
+    st.session_state.pipeline_df = None
+if 'pipeline_stats' not in st.session_state:
+    st.session_state.pipeline_stats = None
 
 # ---------------------------------------------------------------------------
 # Header
@@ -271,6 +281,25 @@ with st.sidebar:
         disabled=(start_date > end_date),
     )
 
+    st.markdown('---')
+
+    st.markdown('### ERA Pipeline')
+    st.caption('Exempt Reporting Advisers approaching the $110M SEC registration threshold')
+    pipeline_col1, pipeline_col2 = st.columns(2)
+    with pipeline_col1:
+        pipeline_aum_min = st.number_input(
+            'Min AUM ($M)', value=50, min_value=0, max_value=500, step=10,
+        )
+    with pipeline_col2:
+        pipeline_aum_max = st.number_input(
+            'Max AUM ($M)', value=150, min_value=10, max_value=1000, step=10,
+        )
+    pipeline_btn = st.button(
+        'Find ERA Pipeline',
+        use_container_width=True,
+        disabled=(pipeline_aum_min >= pipeline_aum_max),
+    )
+
     # Database info
     if st.session_state.discovery_stats:
         stats = st.session_state.discovery_stats
@@ -286,6 +315,24 @@ with st.sidebar:
             f'</div>',
             unsafe_allow_html=True,
         )
+
+    # Hunter.io credit status
+    hunter_key = _get_hunter_api_key()
+    if hunter_key:
+        hunter_info = get_hunter_account_info(hunter_key)
+        if hunter_info:
+            used = hunter_info.get('used', 0)
+            limit = hunter_info.get('limit', 0)
+            remaining = max(0, limit - used)
+            st.markdown('---')
+            st.markdown('### Hunter.io')
+            st.markdown(
+                f'<div class="info-box">'
+                f'<strong>Credits:</strong> {remaining} remaining<br>'
+                f'<strong>Used:</strong> {used} / {limit}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
     # Version footer
     st.markdown('---')
@@ -333,12 +380,19 @@ def _build_col_config(df):
         config['Contact_Email'] = st.column_config.TextColumn('Email')
     if 'Contact_Title' in df.columns:
         config['Contact_Title'] = st.column_config.TextColumn('Title')
+    if 'Contact_Phone' in df.columns:
+        config['Contact_Phone'] = st.column_config.TextColumn('Phone')
+    if 'Contact_LinkedIn' in df.columns:
+        config['Contact_LinkedIn'] = st.column_config.LinkColumn('LinkedIn')
+    if 'AUM_Bracket' in df.columns:
+        config['AUM_Bracket'] = st.column_config.TextColumn('AUM Range')
     return config
 
 
 def _display_cols(df):
     """Return columns to show (hide internal columns from table)."""
-    hide = {'Fit_Reasons', 'AUM', 'Legal_Name'}
+    hide = {'Fit_Reasons', 'AUM', 'Legal_Name', 'SEC_Registered', 'ERA',
+            'AUM_Discretionary', 'AUM_NonDiscretionary'}
     return [c for c in df.columns if c not in hide]
 
 
@@ -423,6 +477,8 @@ if discover_btn:
         df['Contact_Name'] = ''
         df['Contact_Email'] = ''
         df['Contact_Title'] = ''
+        df['Contact_Phone'] = ''
+        df['Contact_LinkedIn'] = ''
 
         # Populate from cache
         cached_count = 0
@@ -437,9 +493,12 @@ if discover_btn:
                 new_indices.append(idx)
             # Populate cached contacts regardless of score cache status
             if crd and crd in cached_enrichments:
-                df.at[idx, 'Contact_Name'] = cached_enrichments[crd].get('contact_name', '')
-                df.at[idx, 'Contact_Email'] = cached_enrichments[crd].get('contact_email', '')
-                df.at[idx, 'Contact_Title'] = cached_enrichments[crd].get('contact_title', '')
+                cached = cached_enrichments[crd]
+                df.at[idx, 'Contact_Name'] = cached.get('contact_name', '')
+                df.at[idx, 'Contact_Email'] = cached.get('contact_email', '')
+                df.at[idx, 'Contact_Title'] = cached.get('contact_title', '')
+                df.at[idx, 'Contact_Phone'] = cached.get('contact_phone', '')
+                df.at[idx, 'Contact_LinkedIn'] = cached.get('contact_linkedin', '')
 
         new_count = len(new_indices)
         st.success(
@@ -509,6 +568,8 @@ if discover_btn:
                     df.at[idx, 'Contact_Name'] = contact['contact_name'] or 'No contact found'
                     df.at[idx, 'Contact_Email'] = contact['contact_email']
                     df.at[idx, 'Contact_Title'] = contact['contact_title']
+                    df.at[idx, 'Contact_Phone'] = contact.get('contact_phone', '')
+                    df.at[idx, 'Contact_LinkedIn'] = contact.get('contact_linkedin', '')
 
                     if crd:
                         new_enrich_records.append({
@@ -516,6 +577,8 @@ if discover_btn:
                             'contact_name': contact['contact_name'],
                             'contact_email': contact['contact_email'],
                             'contact_title': contact['contact_title'],
+                            'contact_phone': contact.get('contact_phone', ''),
+                            'contact_linkedin': contact.get('contact_linkedin', ''),
                         })
                 elif not has_website:
                     df.at[idx, 'Contact_Name'] = 'No website'
@@ -561,77 +624,205 @@ if discover_btn:
         st.rerun()
 
 # ---------------------------------------------------------------------------
+# ERA Pipeline discovery
+# ---------------------------------------------------------------------------
+
+if pipeline_btn:
+    status_container = st.empty()
+    messages = []
+
+    def pipeline_progress(msg):
+        messages.append(msg)
+        status_container.info('\n'.join(messages))
+
+    with st.spinner('Loading ERA pipeline data...'):
+        pipeline_progress('Searching for ERAs approaching $110M threshold...')
+        result = _cached_get_era_pipeline(
+            int(pipeline_aum_min * 1_000_000),
+            int(pipeline_aum_max * 1_000_000),
+        )
+
+    status_container.empty()
+
+    if result['error']:
+        st.error(f"Pipeline failed: {result['error']}")
+    elif result['df'].empty:
+        st.info(f"No ERAs found with AUM ${pipeline_aum_min}M–${pipeline_aum_max}M.")
+    else:
+        df = result['df'].copy()
+        if 'AUM' in df.columns:
+            df['AUM_Display'] = df['AUM'].apply(_format_aum)
+        st.session_state.pipeline_df = df
+        st.session_state.pipeline_stats = {
+            'total_eras': result['total_eras'],
+            'pipeline_count': len(df),
+            'snapshot_date': result['snapshot_date'],
+        }
+        st.rerun()
+
+# ---------------------------------------------------------------------------
 # Main area — Results display
 # ---------------------------------------------------------------------------
 
-display_df = None
-if st.session_state.scored_df is not None and not st.session_state.scored_df.empty:
-    display_df = st.session_state.scored_df
-elif st.session_state.discovered_df is not None and not st.session_state.discovered_df.empty:
-    display_df = st.session_state.discovered_df
+has_ria_data = (
+    (st.session_state.scored_df is not None and not st.session_state.scored_df.empty)
+    or (st.session_state.discovered_df is not None and not st.session_state.discovered_df.empty)
+)
+has_pipeline_data = st.session_state.pipeline_df is not None and not st.session_state.pipeline_df.empty
 
-if display_df is not None:
-    # Metrics row
-    is_scored = st.session_state.scored_df is not None and 'Fit_Score' in display_df.columns
+if has_ria_data or has_pipeline_data:
+    tab_labels = ['New Registrations']
+    if has_pipeline_data:
+        p_count = len(st.session_state.pipeline_df)
+        tab_labels.append(f'ERA Pipeline ({p_count})')
 
-    if is_scored:
-        s_stats = st.session_state.scoring_stats
-        numeric_scores = pd.to_numeric(display_df['Fit_Score'], errors='coerce')
-        avg_score = numeric_scores.mean()
-        avg_label = f'{avg_score:.0f}' if pd.notna(avg_score) else 'N/A'
+    tabs = st.tabs(tab_labels)
 
-        # Calculate AUM summary
-        aum_col = display_df.get('AUM')
-        total_aum = 0
-        if aum_col is not None:
-            total_aum = pd.to_numeric(aum_col, errors='coerce').sum()
-        aum_label = _format_aum(total_aum) if total_aum > 0 else 'N/A'
+    # ---- Tab 1: New Registrations (existing functionality) ----
+    with tabs[0]:
+        display_df = None
+        if st.session_state.scored_df is not None and not st.session_state.scored_df.empty:
+            display_df = st.session_state.scored_df
+        elif st.session_state.discovered_df is not None and not st.session_state.discovered_df.empty:
+            display_df = st.session_state.discovered_df
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric('Total RIAs', len(display_df))
-        m2.metric('Avg Fit Score', avg_label)
-        m3.metric('Total AUM', aum_label)
-        m4.metric('From Cache', s_stats.get('from_cache', 0))
-        m5.metric('States', display_df['State'].nunique())
-    else:
-        m1, m2, m3 = st.columns(3)
-        m1.metric('Total RIAs', len(display_df))
-        m2.metric('States', display_df['State'].nunique())
-        m3.metric('Date Range', f"{start_date.strftime('%m/%d')} — {end_date.strftime('%m/%d')}")
+        if display_df is not None:
+            is_scored = st.session_state.scored_df is not None and 'Fit_Score' in display_df.columns
 
-    st.markdown('---')
+            if is_scored:
+                s_stats = st.session_state.scoring_stats
+                numeric_scores = pd.to_numeric(display_df['Fit_Score'], errors='coerce')
+                avg_score = numeric_scores.mean()
+                avg_label = f'{avg_score:.0f}' if pd.notna(avg_score) else 'N/A'
 
-    # Filters
-    filter_col1, filter_col2 = st.columns([1, 3])
-    with filter_col1:
-        states = sorted(display_df['State'].dropna().unique().tolist())
-        selected_states = st.multiselect('Filter by State', states, default=[])
+                aum_col = display_df.get('AUM')
+                total_aum = 0
+                if aum_col is not None:
+                    total_aum = pd.to_numeric(aum_col, errors='coerce').sum()
+                aum_label = _format_aum(total_aum) if total_aum > 0 else 'N/A'
 
-    filtered_df = display_df.copy()
-    if selected_states:
-        filtered_df = filtered_df[filtered_df['State'].isin(selected_states)]
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric('Total RIAs', len(display_df))
+                m2.metric('Avg Fit Score', avg_label)
+                m3.metric('Total AUM', aum_label)
+                m4.metric('From Cache', s_stats.get('from_cache', 0))
+                m5.metric('States', display_df['State'].nunique())
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric('Total RIAs', len(display_df))
+                m2.metric('States', display_df['State'].nunique())
+                m3.metric('Date Range', f"{start_date.strftime('%m/%d')} - {end_date.strftime('%m/%d')}")
 
-    # Data table
-    st.dataframe(
-        filtered_df[_display_cols(filtered_df)],
-        use_container_width=True,
-        height=500,
-        column_config=_build_col_config(filtered_df),
-    )
+            st.markdown('---')
 
-    st.caption(f'Showing {len(filtered_df)} of {len(display_df)} records')
+            # Filters
+            filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
+            with filter_col1:
+                states = sorted(display_df['State'].dropna().unique().tolist())
+                selected_states = st.multiselect('Filter by State', states, default=[], key='ria_state_filter')
+            with filter_col2:
+                if 'AUM_Bracket' in display_df.columns:
+                    brackets = [str(b) for b in display_df['AUM_Bracket'].dropna().unique().tolist()]
+                    selected_brackets = st.multiselect('Filter by AUM', sorted(brackets), default=[], key='ria_aum_filter')
+                else:
+                    selected_brackets = []
 
-    # Download (includes Fit_Reasons in CSV)
-    csv_data = filtered_df.to_csv(index=False).encode('utf-8-sig')
-    filename = f'surge_rias_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.csv'
+            filtered_df = display_df.copy()
+            if selected_states:
+                filtered_df = filtered_df[filtered_df['State'].isin(selected_states)]
+            if selected_brackets and 'AUM_Bracket' in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df['AUM_Bracket'].astype(str).isin(selected_brackets)]
 
-    st.download_button(
-        label=f'Download CSV ({len(filtered_df)} records)',
-        data=csv_data,
-        file_name=filename,
-        mime='text/csv',
-    )
+            st.dataframe(
+                filtered_df[_display_cols(filtered_df)],
+                use_container_width=True,
+                height=500,
+                column_config=_build_col_config(filtered_df),
+            )
 
+            st.caption(f'Showing {len(filtered_df)} of {len(display_df)} records')
+
+            csv_data = filtered_df.to_csv(index=False).encode('utf-8-sig')
+            filename = f'surge_rias_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.csv'
+
+            st.download_button(
+                label=f'Download CSV ({len(filtered_df)} records)',
+                data=csv_data,
+                file_name=filename,
+                mime='text/csv',
+                key='ria_download',
+            )
+        else:
+            st.info('Click **Find New RIAs** in the sidebar to discover recent SEC registrations.')
+
+    # ---- Tab 2: ERA Pipeline ----
+    if has_pipeline_data and len(tabs) > 1:
+        with tabs[1]:
+            p_df = st.session_state.pipeline_df
+            p_stats = st.session_state.pipeline_stats
+
+            # Metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric('Pipeline Prospects', len(p_df))
+            m2.metric('Total ERAs', p_stats.get('total_eras', 0))
+
+            # Count firms in transition zone ($100M-$110M)
+            if 'AUM' in p_df.columns:
+                transition = p_df[(p_df['AUM'] >= 100_000_000) & (p_df['AUM'] < 110_000_000)]
+                m3.metric('In Transition Zone', len(transition))
+                total_pipeline_aum = pd.to_numeric(p_df['AUM'], errors='coerce').sum()
+                m4.metric('Total Pipeline AUM', _format_aum(total_pipeline_aum))
+
+            st.markdown('---')
+
+            st.markdown(
+                '<div class="info-box">'
+                '<strong>SEC Registration Thresholds:</strong><br>'
+                '&bull; < $100M — Typically state-registered<br>'
+                '&bull; $100M–$110M — <strong style="color:#f59e0b;">Transition zone</strong> (may need SEC registration soon)<br>'
+                '&bull; >= $110M — <strong style="color:#ef4444;">SEC registration required</strong><br>'
+                '&bull; Private fund advisers >= $150M — SEC registration required'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown('')
+
+            # Filters
+            p_filter_col1, p_filter_col2, p_filter_col3 = st.columns([1, 1, 2])
+            with p_filter_col1:
+                p_states = sorted(p_df['State'].dropna().unique().tolist())
+                p_selected_states = st.multiselect('Filter by State', p_states, default=[], key='pipeline_state_filter')
+            with p_filter_col2:
+                if 'AUM_Bracket' in p_df.columns:
+                    p_brackets = [str(b) for b in p_df['AUM_Bracket'].dropna().unique().tolist()]
+                    p_selected_brackets = st.multiselect('Filter by AUM', sorted(p_brackets), default=[], key='pipeline_aum_filter')
+                else:
+                    p_selected_brackets = []
+
+            p_filtered = p_df.copy()
+            if p_selected_states:
+                p_filtered = p_filtered[p_filtered['State'].isin(p_selected_states)]
+            if p_selected_brackets and 'AUM_Bracket' in p_filtered.columns:
+                p_filtered = p_filtered[p_filtered['AUM_Bracket'].astype(str).isin(p_selected_brackets)]
+
+            st.dataframe(
+                p_filtered[_display_cols(p_filtered)],
+                use_container_width=True,
+                height=500,
+                column_config=_build_col_config(p_filtered),
+            )
+
+            st.caption(f'Showing {len(p_filtered)} of {len(p_df)} ERA pipeline prospects')
+
+            p_csv_data = p_filtered.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label=f'Download Pipeline CSV ({len(p_filtered)} records)',
+                data=p_csv_data,
+                file_name='surge_era_pipeline.csv',
+                mime='text/csv',
+                key='pipeline_download',
+            )
 
 else:
     # Empty state
@@ -640,6 +831,7 @@ else:
         '<div style="text-align:center; padding: 4rem 2rem; color: #8B99AD;">'
         '<h3 style="color:#0b4f6c;">Ready to discover new RIAs</h3>'
         '<p>Select a date range in the sidebar and click <strong>Find New RIAs</strong> to begin.</p>'
+        '<p>Or click <strong>Find ERA Pipeline</strong> to find advisers approaching the $110M SEC registration threshold.</p>'
         '<p style="font-size:0.8rem; margin-top:2rem;">'
         'Data sourced from SEC FOIA Investment Adviser database &amp; Form ADV filings.'
         '</p>'

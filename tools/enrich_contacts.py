@@ -1,9 +1,11 @@
 """
 Contact enrichment tool for RIA firms.
 
-Given a website URL, discovers contact name, email, and title using:
+Given a website URL, discovers contact name, email, title, phone, and
+LinkedIn using:
 1. Hunter.io Domain Search API (if API key configured)
-2. Website scraping (/contact, /about, /team pages)
+2. Hunter.io Email Finder API (targeted fallback when name found but no email)
+3. Website scraping (/contact, /about, /team pages)
 """
 
 import requests
@@ -147,7 +149,8 @@ def _hunter_domain_search(domain, api_key):
     """Query Hunter.io Domain Search API for emails at a domain.
 
     Free tier: 50 searches/month, up to 10 results per call.
-    Returns list of dicts with keys: name, email, title, source.
+    Returns list of dicts with keys: name, email, title, source,
+    confidence, seniority, department, phone, linkedin, verified.
     """
     if not domain or not api_key:
         return []
@@ -179,17 +182,99 @@ def _hunter_domain_search(domain, api_key):
             first = (entry.get('first_name') or '').strip()
             last = (entry.get('last_name') or '').strip()
             name = f'{first} {last}'.strip() if first or last else ''
+            verification = entry.get('verification') or {}
             results.append({
                 'name': name,
                 'email': entry.get('value', ''),
                 'title': entry.get('position') or '',
                 'source': 'hunter.io',
+                'confidence': entry.get('confidence') or 0,
+                'seniority': entry.get('seniority') or '',
+                'department': entry.get('department') or '',
+                'phone': entry.get('phone_number') or '',
+                'linkedin': entry.get('linkedin') or '',
+                'verified': verification.get('status') or '',
             })
         return results
 
     except requests.RequestException as e:
         logger.debug('Hunter.io request failed for %s: %s', domain, e)
         return []
+
+
+def _hunter_email_finder(domain, first_name, last_name, api_key):
+    """Find the most likely email for a person at a domain.
+
+    Uses 1 credit per successful lookup. Call only when we have a name
+    from scraping but no email.
+    Returns dict with keys: email, confidence, phone, linkedin, verified
+    or empty dict on failure.
+    """
+    if not domain or not api_key or not last_name:
+        return {}
+
+    url = 'https://api.hunter.io/v2/email-finder'
+    params = {
+        'domain': domain,
+        'first_name': first_name,
+        'last_name': last_name,
+        'api_key': api_key,
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code in (429, 401):
+            return {}
+        if resp.status_code != 200:
+            logger.debug('Hunter.io Email Finder returned HTTP %d', resp.status_code)
+            return {}
+
+        data = resp.json().get('data', {})
+        email = data.get('email') or ''
+        if not email:
+            return {}
+
+        verification = data.get('verification') or {}
+        return {
+            'email': email,
+            'confidence': data.get('score') or 0,
+            'phone': data.get('phone_number') or '',
+            'linkedin': data.get('linkedin') or '',
+            'verified': verification.get('status') or '',
+        }
+
+    except requests.RequestException as e:
+        logger.debug('Hunter.io Email Finder failed: %s', e)
+        return {}
+
+
+def get_hunter_account_info(api_key):
+    """Check Hunter.io account status (remaining credits).
+
+    Free endpoint — does not consume credits.
+    Returns dict with keys: used, limit, remaining (or empty on failure).
+    """
+    if not api_key:
+        return {}
+
+    try:
+        resp = requests.get(
+            'https://api.hunter.io/v2/account',
+            params={'api_key': api_key},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return {}
+
+        data = resp.json().get('data', {})
+        requests_info = data.get('requests') or {}
+        searches = requests_info.get('searches') or {}
+        return {
+            'used': searches.get('used') or 0,
+            'limit': searches.get('available') or 0,
+        }
+    except requests.RequestException:
+        return {}
 
 
 def _fetch_page_soup(url):
@@ -464,19 +549,26 @@ def _scrape_website_contacts(website_url):
     return all_contacts
 
 
+def _seniority_rank(seniority):
+    """Rank Hunter.io seniority levels (lower = more senior)."""
+    ranks = {'executive': 0, 'senior': 1, 'management': 2}
+    return ranks.get((seniority or '').lower(), 5)
+
+
 def _select_best_contact(candidates):
     """Select the best contact by merging the best name+title with the best email.
 
     On small RIA sites, the founder's name/title and a contact email often appear
     as separate entries (e.g., "Sam Caspersen, CEO" on the about page and
     "marc@firm.com" in the footer). This function merges them:
-    1. Find the best *named* contact (by title priority)
-    2. Find the best *email* (prefer domain-matching, non-generic)
+    1. Find the best *named* contact (by title priority, seniority, confidence)
+    2. Find the best *email* (prefer verified, domain-matching, non-generic)
     3. If the named contact has no email, attach the best available email
 
-    Returns dict with keys: name, email, title (any may be empty string).
+    Returns dict with keys: name, email, title, phone, linkedin
+    (any may be empty string).
     """
-    empty = {'name': '', 'email': '', 'title': ''}
+    empty = {'name': '', 'email': '', 'title': '', 'phone': '', 'linkedin': ''}
     if not candidates:
         return empty
 
@@ -493,31 +585,53 @@ def _select_best_contact(candidates):
     if named:
         named.sort(key=lambda c: (
             _title_rank(c.get('title', '')),
+            _seniority_rank(c.get('seniority', '')),
             0 if c.get('source') == 'hunter.io' else 1,
+            -(c.get('confidence') or 0),
         ))
         best_named = named[0]
 
     # Find the best email across all candidates
+    # Prefer verified > unverified, and emails matched to the best named contact
     best_email = ''
+    best_email_candidate = None
     for c in candidates:
         email = c.get('email', '').strip()
         if email:
-            # If the named contact already has an email matched to them, use it
             if best_named and c.get('name') == best_named.get('name') and email:
                 best_email = email
+                best_email_candidate = c
                 break
             if not best_email:
                 best_email = email
+                best_email_candidate = c
+            elif c.get('verified') == 'valid' and (best_email_candidate or {}).get('verified') != 'valid':
+                best_email = email
+                best_email_candidate = c
+
+    # Collect phone and linkedin from the best sources available
+    phone = ''
+    linkedin = ''
+    for c in ([best_named, best_email_candidate] + candidates):
+        if c is None:
+            continue
+        if not phone and c.get('phone'):
+            phone = c['phone']
+        if not linkedin and c.get('linkedin'):
+            linkedin = c['linkedin']
+        if phone and linkedin:
+            break
 
     if best_named:
         return {
             'name': best_named.get('name', '').strip(),
             'email': best_named.get('email', '').strip() or best_email,
             'title': best_named.get('title', '').strip(),
+            'phone': phone,
+            'linkedin': linkedin,
         }
     elif best_email:
-        # No named contact found, return best email
-        return {'name': '', 'email': best_email, 'title': ''}
+        return {'name': '', 'email': best_email, 'title': '', 'phone': phone, 'linkedin': linkedin}
     else:
         return empty
 
@@ -526,19 +640,22 @@ def enrich_contact(website_url, hunter_api_key=None):
     """Discover the best contact for an RIA firm.
 
     Combines Hunter.io (if API key provided) and website scraping.
+    Uses Email Finder as a targeted fallback when scraping finds a name
+    but no email.
 
     Args:
         website_url: The firm's website URL from SEC data
         hunter_api_key: Optional Hunter.io API key (skip if None/empty)
 
     Returns:
-        dict with keys: contact_name, contact_email, contact_title
+        dict with keys: contact_name, contact_email, contact_title,
+        contact_phone, contact_linkedin
     """
     all_candidates = []
 
     domain = extract_domain(website_url)
 
-    # Method 1: Hunter.io (if configured)
+    # Method 1: Hunter.io Domain Search (if configured)
     if hunter_api_key and domain:
         hunter_results = _hunter_domain_search(domain, hunter_api_key)
         all_candidates.extend(hunter_results)
@@ -549,8 +666,23 @@ def enrich_contact(website_url, hunter_api_key=None):
 
     best = _select_best_contact(all_candidates)
 
+    # Method 3: Email Finder fallback — if we have a name but no email,
+    # try a targeted lookup (1 credit). Only fires when needed.
+    if hunter_api_key and domain and best['name'] and not best['email']:
+        parts = best['name'].split()
+        if len(parts) >= 2:
+            found = _hunter_email_finder(domain, parts[0], parts[-1], hunter_api_key)
+            if found.get('email'):
+                best['email'] = found['email']
+                if not best['phone'] and found.get('phone'):
+                    best['phone'] = found['phone']
+                if not best['linkedin'] and found.get('linkedin'):
+                    best['linkedin'] = found['linkedin']
+
     return {
         'contact_name': best['name'],
         'contact_email': best['email'],
         'contact_title': best['title'],
+        'contact_phone': best.get('phone', ''),
+        'contact_linkedin': best.get('linkedin', ''),
     }

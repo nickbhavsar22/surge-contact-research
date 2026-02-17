@@ -18,7 +18,7 @@ HEADERS = {
 
 SEC_BASE_URL = 'https://www.sec.gov/files/investment/data/information-about-registered-investment-advisers-exempt-reporting-advisers/'
 
-# Only the columns the app actually uses (13 out of 448)
+# Only the columns the app actually uses (16 out of 448)
 KEEP_COLUMNS = [
     'Primary Business Name',
     'Organization CRD#',
@@ -30,9 +30,13 @@ KEEP_COLUMNS = [
     'Main Office Telephone Number',
     'Website Address',
     'Legal Name',
+    '2A(1)',    # SEC-registered investment adviser (Y/N)
+    '2A(2)',    # Exempt Reporting Adviser (Y/N)
     '5A',       # Employees
     '5C(1)',    # Clients
-    '5F(2)(c)', # AUM
+    '5F(2)(a)', # Discretionary AUM
+    '5F(2)(b)', # Non-discretionary AUM
+    '5F(2)(c)', # Total AUM
 ]
 
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / 'data' / 'sec_advisers.csv'

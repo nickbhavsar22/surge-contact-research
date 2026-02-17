@@ -24,7 +24,7 @@ def _connect():
 
 
 def init_db():
-    """Create the cache table if it doesn't exist."""
+    """Create the cache table if it doesn't exist, and migrate if needed."""
     with _connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ria_cache (
@@ -37,9 +37,16 @@ def init_db():
                 contact_name   TEXT,
                 contact_email  TEXT,
                 contact_title  TEXT,
-                enriched_at    TEXT
+                enriched_at    TEXT,
+                contact_phone    TEXT,
+                contact_linkedin TEXT
             )
         """)
+        # Migrate existing tables missing the new columns
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(ria_cache)").fetchall()}
+        for col in ('contact_phone', 'contact_linkedin'):
+            if col not in existing:
+                conn.execute(f"ALTER TABLE ria_cache ADD COLUMN {col} TEXT")
         conn.commit()
 
 
@@ -112,7 +119,7 @@ def lookup_enrichments(crd_list):
         crd_list: list of CRD numbers (int)
 
     Returns:
-        dict[int, dict] mapping CRD → {'contact_name': ..., 'contact_email': ..., 'contact_title': ...}
+        dict[int, dict] mapping CRD → contact fields dict.
         Only includes CRDs that have been enriched (enriched_at is not NULL).
     """
     if not crd_list:
@@ -125,7 +132,8 @@ def lookup_enrichments(crd_list):
             chunk = crd_list[i:i + 500]
             placeholders = ','.join('?' * len(chunk))
             rows = conn.execute(
-                f"SELECT crd, contact_name, contact_email, contact_title FROM ria_cache "
+                f"SELECT crd, contact_name, contact_email, contact_title, "
+                f"contact_phone, contact_linkedin FROM ria_cache "
                 f"WHERE crd IN ({placeholders}) AND enriched_at IS NOT NULL",
                 chunk,
             ).fetchall()
@@ -134,6 +142,8 @@ def lookup_enrichments(crd_list):
                     'contact_name': row['contact_name'],
                     'contact_email': row['contact_email'],
                     'contact_title': row['contact_title'],
+                    'contact_phone': row['contact_phone'] or '',
+                    'contact_linkedin': row['contact_linkedin'] or '',
                 }
     return result
 
@@ -142,25 +152,39 @@ def save_enrichments(records):
     """Upsert enrichment data for a batch of RIAs.
 
     Args:
-        records: list of dicts with keys: crd, contact_name, contact_email, contact_title
+        records: list of dicts with keys: crd, contact_name, contact_email,
+                 contact_title, contact_phone, contact_linkedin
     """
     if not records:
         return
 
     init_db()
     now = datetime.now(timezone.utc).isoformat()
+    # Ensure new fields have defaults for backwards compatibility
+    enriched = []
+    for r in records:
+        enriched.append({
+            'contact_phone': '',
+            'contact_linkedin': '',
+            **r,
+            'enriched_at': now,
+        })
     with _connect() as conn:
         conn.executemany(
             """
-            INSERT INTO ria_cache (crd, contact_name, contact_email, contact_title, enriched_at)
-            VALUES (:crd, :contact_name, :contact_email, :contact_title, :enriched_at)
+            INSERT INTO ria_cache (crd, contact_name, contact_email, contact_title,
+                                   contact_phone, contact_linkedin, enriched_at)
+            VALUES (:crd, :contact_name, :contact_email, :contact_title,
+                    :contact_phone, :contact_linkedin, :enriched_at)
             ON CONFLICT(crd) DO UPDATE SET
-                contact_name  = excluded.contact_name,
-                contact_email = excluded.contact_email,
-                contact_title = excluded.contact_title,
-                enriched_at   = excluded.enriched_at
+                contact_name     = excluded.contact_name,
+                contact_email    = excluded.contact_email,
+                contact_title    = excluded.contact_title,
+                contact_phone    = excluded.contact_phone,
+                contact_linkedin = excluded.contact_linkedin,
+                enriched_at      = excluded.enriched_at
             """,
-            [{**r, 'enriched_at': now} for r in records],
+            enriched,
         )
         conn.commit()
     logger.info("Saved %d enrichments to cache", len(records))

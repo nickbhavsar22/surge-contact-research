@@ -159,8 +159,12 @@ def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=Fal
         'Main Office Telephone Number': 'Phone',
         'Website Address': 'Website',
         'Legal Name': 'Legal_Name',
+        '2A(1)': 'SEC_Registered',
+        '2A(2)': 'ERA',
         '5A': 'Employees',
         '5C(1)': 'Clients',
+        '5F(2)(a)': 'AUM_Discretionary',
+        '5F(2)(b)': 'AUM_NonDiscretionary',
         '5F(2)(c)': 'AUM',
     }
 
@@ -168,16 +172,25 @@ def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=Fal
     result = new_rias[available_cols].copy()
     result.columns = [output_cols[col] for col in available_cols]
 
-    # Clean AUM column: strip whitespace, convert to numeric
+    # Clean AUM columns: strip whitespace, convert to numeric
+    for aum_col in ['AUM', 'AUM_Discretionary', 'AUM_NonDiscretionary']:
+        if aum_col in result.columns:
+            result[aum_col] = (
+                result[aum_col]
+                .astype(str)
+                .str.strip()
+                .str.replace(',', '', regex=False)
+                .str.replace('.00', '', regex=False)
+            )
+            result[aum_col] = pd.to_numeric(result[aum_col], errors='coerce').fillna(0).astype(int)
+
+    # Add AUM bracket column for threshold intelligence
     if 'AUM' in result.columns:
-        result['AUM'] = (
-            result['AUM']
-            .astype(str)
-            .str.strip()
-            .str.replace(',', '', regex=False)
-            .str.replace('.00', '', regex=False)
+        result['AUM_Bracket'] = pd.cut(
+            result['AUM'],
+            bins=[-1, 0, 100_000_000, 110_000_000, 150_000_000, float('inf')],
+            labels=['No AUM', '< $100M', '$100M–$110M', '$110M–$150M', '$150M+'],
         )
-        result['AUM'] = pd.to_numeric(result['AUM'], errors='coerce').fillna(0).astype(int)
 
     # Clean Employees and Clients columns
     for col in ['Employees', 'Clients']:
@@ -196,6 +209,127 @@ def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=Fal
         'snapshot_date': data_date.strftime('%Y-%m-%d'),
         'zip_url': zip_url,
         'error': None
+    }
+
+
+def get_era_pipeline(aum_min=50_000_000, aum_max=150_000_000, progress_callback=None):
+    """
+    Fetch Exempt Reporting Advisers approaching the SEC registration threshold.
+
+    ERAs with AUM between aum_min and aum_max are potential SEC registrants.
+    The $110M threshold triggers mandatory SEC registration.
+
+    Returns:
+        dict with keys:
+            'df': DataFrame with ERA pipeline prospects
+            'total_eras': int, total ERAs in SEC database
+            'total_records': int, total records in SEC database
+            'snapshot_date': str, date of the SEC data snapshot
+            'error': str or None
+    """
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+        else:
+            print(msg)
+
+    # Load data (same source as get_recent_rias)
+    zip_url = None
+    df = _load_predownloaded_csv(log=log)
+
+    if df is None:
+        log('No pre-downloaded data found. Downloading from SEC...')
+        candidates = _build_candidate_urls()
+        download = _download_sec_zip(candidates, HEADERS, timeout=300, log=log)
+
+        if download is None:
+            error_msg = 'Could not load SEC data.'
+            log(f'ERROR: {error_msg}')
+            return {'df': pd.DataFrame(), 'total_eras': 0, 'total_records': 0,
+                    'snapshot_date': None, 'error': error_msg}
+
+        resp, zip_url, url_label = download
+        log(f'Downloaded SEC database: {url_label}')
+
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            with z.open(z.namelist()[0]) as f:
+                df = pd.read_csv(f, encoding='latin-1', low_memory=False)
+
+    df['Status_Date'] = pd.to_datetime(df['SEC Status Effective Date'], errors='coerce')
+    data_date = df['Status_Date'].max()
+    total_records = len(df)
+
+    # Filter for ERAs: 2A(2) = Y
+    if '2A(2)' not in df.columns:
+        return {'df': pd.DataFrame(), 'total_eras': 0, 'total_records': total_records,
+                'snapshot_date': data_date.strftime('%Y-%m-%d'),
+                'error': 'ERA column (2A(2)) not found in data. Re-run data pipeline.'}
+
+    eras = df[df['2A(2)'] == 'Y'].copy()
+    total_eras = len(eras)
+    log(f'Found {total_eras} Exempt Reporting Advisers in database')
+
+    # Map columns
+    output_cols = {
+        'Primary Business Name': 'Company',
+        'Organization CRD#': 'CRD',
+        'Status_Date': 'Registered',
+        'SEC Current Status': 'Status',
+        'Main Office City': 'City',
+        'Main Office State': 'State',
+        'Main Office Telephone Number': 'Phone',
+        'Website Address': 'Website',
+        'Legal Name': 'Legal_Name',
+        '2A(1)': 'SEC_Registered',
+        '2A(2)': 'ERA',
+        '5A': 'Employees',
+        '5C(1)': 'Clients',
+        '5F(2)(a)': 'AUM_Discretionary',
+        '5F(2)(b)': 'AUM_NonDiscretionary',
+        '5F(2)(c)': 'AUM',
+    }
+
+    available_cols = [col for col in output_cols.keys() if col in eras.columns]
+    result = eras[available_cols].copy()
+    result.columns = [output_cols[col] for col in available_cols]
+
+    # Clean AUM columns
+    for aum_col in ['AUM', 'AUM_Discretionary', 'AUM_NonDiscretionary']:
+        if aum_col in result.columns:
+            result[aum_col] = (
+                result[aum_col]
+                .astype(str)
+                .str.strip()
+                .str.replace(',', '', regex=False)
+                .str.replace('.00', '', regex=False)
+            )
+            result[aum_col] = pd.to_numeric(result[aum_col], errors='coerce').fillna(0).astype(int)
+
+    # Add AUM bracket
+    if 'AUM' in result.columns:
+        result['AUM_Bracket'] = pd.cut(
+            result['AUM'],
+            bins=[-1, 0, 100_000_000, 110_000_000, 150_000_000, float('inf')],
+            labels=['No AUM', '< $100M', '$100M–$110M', '$110M–$150M', '$150M+'],
+        )
+
+    # Clean Employees and Clients columns
+    for col in ['Employees', 'Clients']:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors='coerce').fillna(0).astype(int)
+
+    # Filter to AUM range
+    pipeline = result[(result['AUM'] >= aum_min) & (result['AUM'] <= aum_max)].copy()
+    pipeline = pipeline.sort_values('AUM', ascending=False)
+
+    log(f'Pipeline: {len(pipeline)} ERAs with AUM ${aum_min/1e6:.0f}M–${aum_max/1e6:.0f}M')
+
+    return {
+        'df': pipeline,
+        'total_eras': total_eras,
+        'total_records': total_records,
+        'snapshot_date': data_date.strftime('%Y-%m-%d'),
+        'error': None,
     }
 
 
