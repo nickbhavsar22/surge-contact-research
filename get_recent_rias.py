@@ -192,6 +192,17 @@ def get_recent_rias(days_back=30, start_date=None, end_date=None, export_csv=Fal
             labels=['No AUM', '< $100M', '$100M–$110M', '$110M–$150M', '$150M+'],
         )
 
+    # Derive registration type with sub-threshold flag
+    if 'SEC_Registered' in result.columns and 'ERA' in result.columns:
+        def _reg_type(r):
+            if str(r.get('SEC_Registered', '')).strip().upper() == 'Y':
+                aum = r.get('AUM', 0) if pd.notna(r.get('AUM', 0)) else 0
+                return 'SEC (Sub-threshold)' if aum < 100_000_000 else 'SEC-Registered'
+            if str(r.get('ERA', '')).strip().upper() == 'Y':
+                return 'ERA'
+            return 'State-Registered'
+        result['Registration_Type'] = result.apply(_reg_type, axis=1)
+
     # Clean Employees and Clients columns
     for col in ['Employees', 'Clients']:
         if col in result.columns:
@@ -312,6 +323,17 @@ def get_era_pipeline(aum_min=50_000_000, aum_max=150_000_000, progress_callback=
             bins=[-1, 0, 100_000_000, 110_000_000, 150_000_000, float('inf')],
             labels=['No AUM', '< $100M', '$100M–$110M', '$110M–$150M', '$150M+'],
         )
+
+    # Derive registration type with sub-threshold flag
+    if 'SEC_Registered' in result.columns and 'ERA' in result.columns:
+        def _reg_type_era(r):
+            if str(r.get('SEC_Registered', '')).strip().upper() == 'Y':
+                aum = r.get('AUM', 0) if pd.notna(r.get('AUM', 0)) else 0
+                return 'SEC (Sub-threshold)' if aum < 100_000_000 else 'SEC-Registered'
+            if str(r.get('ERA', '')).strip().upper() == 'Y':
+                return 'ERA'
+            return 'State-Registered'
+        result['Registration_Type'] = result.apply(_reg_type_era, axis=1)
 
     # Clean Employees and Clients columns
     for col in ['Employees', 'Clients']:

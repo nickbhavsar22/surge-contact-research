@@ -3,7 +3,7 @@ Surge Contact Research — Streamlit UI
 Discover newly registered RIAs, score them against SurgeONE.ai's ICP.
 """
 
-__version__ = "1.0.5"
+__version__ = "1.1.3"
 
 import streamlit as st
 import pandas as pd
@@ -386,6 +386,8 @@ def _build_col_config(df):
         config['Contact_LinkedIn'] = st.column_config.LinkColumn('LinkedIn')
     if 'AUM_Bracket' in df.columns:
         config['AUM_Bracket'] = st.column_config.TextColumn('AUM Range')
+    if 'Registration_Type' in df.columns:
+        config['Registration_Type'] = st.column_config.TextColumn('Reg Type')
     return config
 
 
@@ -705,7 +707,11 @@ if has_ria_data or has_pipeline_data:
                 m1.metric('Total RIAs', len(display_df))
                 m2.metric('Avg Fit Score', avg_label)
                 m3.metric('Total AUM', aum_label)
-                m4.metric('From Cache', s_stats.get('from_cache', 0))
+                if 'Registration_Type' in display_df.columns:
+                    state_reg_count = (display_df['Registration_Type'] == 'State-Registered').sum()
+                    m4.metric('State-Registered', state_reg_count)
+                else:
+                    m4.metric('From Cache', s_stats.get('from_cache', 0))
                 m5.metric('States', display_df['State'].nunique())
             else:
                 m1, m2, m3 = st.columns(3)
@@ -716,7 +722,7 @@ if has_ria_data or has_pipeline_data:
             st.markdown('---')
 
             # Filters
-            filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
+            filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 1])
             with filter_col1:
                 states = sorted(display_df['State'].dropna().unique().tolist())
                 selected_states = st.multiselect('Filter by State', states, default=[], key='ria_state_filter')
@@ -726,12 +732,24 @@ if has_ria_data or has_pipeline_data:
                     selected_brackets = st.multiselect('Filter by AUM', sorted(brackets), default=[], key='ria_aum_filter')
                 else:
                     selected_brackets = []
+            with filter_col3:
+                if 'Registration_Type' in display_df.columns:
+                    reg_types = sorted(display_df['Registration_Type'].dropna().unique().tolist())
+                    selected_reg_types = st.multiselect(
+                        'Registration Type', reg_types,
+                        default=['State-Registered'],
+                        key='ria_reg_type_filter',
+                    )
+                else:
+                    selected_reg_types = []
 
             filtered_df = display_df.copy()
             if selected_states:
                 filtered_df = filtered_df[filtered_df['State'].isin(selected_states)]
             if selected_brackets and 'AUM_Bracket' in filtered_df.columns:
                 filtered_df = filtered_df[filtered_df['AUM_Bracket'].astype(str).isin(selected_brackets)]
+            if selected_reg_types and 'Registration_Type' in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df['Registration_Type'].isin(selected_reg_types)]
 
             st.dataframe(
                 filtered_df[_display_cols(filtered_df)],
